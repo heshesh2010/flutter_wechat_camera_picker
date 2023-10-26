@@ -24,6 +24,7 @@ import '../widgets/camera_focus_point.dart';
 import '../widgets/camera_picker.dart';
 import '../widgets/camera_picker_viewer.dart';
 import '../widgets/camera_progress_button.dart';
+import 'package:sensors_plus/sensors_plus.dart';
 
 const Color _lockedColor = Colors.orangeAccent;
 const Duration _kDuration = Duration(milliseconds: 300);
@@ -33,6 +34,9 @@ class CameraPickerState extends State<CameraPicker>
   /// The [Duration] for record detection. (200ms)
   /// 检测是否开始录制的时长 (200毫秒)
   final Duration recordDetectDuration = const Duration(milliseconds: 200);
+
+  /// Subscribe to the accelerometer.
+  late final StreamSubscription<AccelerometerEvent> accelerometerSubscription;
 
   /// The last exposure point offset on the screen.
   /// 最后一次手动聚焦的点坐标
@@ -215,6 +219,9 @@ class CameraPickerState extends State<CameraPicker>
     Constants.textDelegate = widget.pickerConfig.textDelegate ??
         cameraPickerTextDelegateFromLocale(widget.locale);
     initCameras();
+    accelerometerSubscription = accelerometerEvents.listen(
+      handleAccelerometerEvent,
+    );
   }
 
   @override
@@ -231,6 +238,7 @@ class CameraPickerState extends State<CameraPicker>
     exposureFadeOutTimer?.cancel();
     recordDetectTimer?.cancel();
     recordCountdownTimer?.cancel();
+    accelerometerSubscription.cancel();
     super.dispose();
   }
 
@@ -297,6 +305,42 @@ class CameraPickerState extends State<CameraPicker>
     }
   }
 
+  /// Lock capture orientation according to the current status of the device,
+  /// which enables the captured file stored the correct orientation.
+  void handleAccelerometerEvent(AccelerometerEvent event) {
+    if (pickerConfig.lockCaptureOrientation != null ||
+        innerController == null ||
+        isControllerBusy) {
+      return;
+    }
+    final x = event.x, y = event.y, z = event.z;
+    realDebugPrint('X:$x Y:$y Z:$z');
+    final bool isLeft;
+    if (x > 0) {
+      isLeft = Platform.isAndroid ? true : false;
+    } else {
+      isLeft = Platform.isAndroid ? false : true;
+    }
+    if (!mounted) {
+      return;
+    }
+    if (z < 9) {
+      if (y > 5) {
+        realDebugPrint('Accelerometer portrait');
+        controller.lockCaptureOrientation(DeviceOrientation.portraitUp);
+      } else if (y < 5) {
+        realDebugPrint('Accelerometer landscape');
+        controller.lockCaptureOrientation(
+          isLeft
+              ? DeviceOrientation.landscapeLeft
+              : DeviceOrientation.landscapeRight,
+        );
+      }
+    } else {
+      controller.lockCaptureOrientation(DeviceOrientation.portraitUp);
+    }
+  }
+
   /// Initialize cameras instances.
   /// 初始化相机实例
   Future<void> initCameras([CameraDescription? cameraDescription]) async {
@@ -343,6 +387,7 @@ class CameraPickerState extends State<CameraPicker>
           StackTrace.current,
           pickerConfig.onError,
         );
+        return;
       }
 
       initFlashModesForCameras();
@@ -622,9 +667,10 @@ class CameraPickerState extends State<CameraPicker>
       await controller.setExposureMode(newMode);
     } catch (e, s) {
       handleErrorWithHandler(e, s, pickerConfig.onError);
+    } finally {
+      restartExposureModeDisplayTimer();
+      restartExposureFadeOutTimer();
     }
-    restartExposureModeDisplayTimer();
-    restartExposureFadeOutTimer();
   }
 
   /// Use the [position] to set exposure and focus.
@@ -715,16 +761,17 @@ class CameraPickerState extends State<CameraPicker>
       );
     } catch (e, s) {
       handleErrorWithHandler(e, s, pickerConfig.onError);
+    } finally {
+      if (!hasError && !isFocusPointDisplays.value) {
+        isFocusPointDisplays.value = true;
+      }
+      restartExposurePointDisplayTimer();
+      restartExposureModeDisplayTimer();
+      restartExposureFadeOutTimer();
       hasError = true;
       currentExposureSliderOffset.value = previousSliderOffsetValue;
       currentExposureOffset.value = previousOffsetValue;
     }
-    if (!hasError && !isFocusPointDisplays.value) {
-      isFocusPointDisplays.value = true;
-    }
-    restartExposurePointDisplayTimer();
-    restartExposureModeDisplayTimer();
-    restartExposureFadeOutTimer();
   }
 
   /// Request to set the focus and the exposure point on the [localPosition],
@@ -897,8 +944,9 @@ class CameraPickerState extends State<CameraPicker>
         recordCountdownTimer?.cancel();
         isShootingButtonAnimate = false;
         handleErrorWithHandler(e, s, pickerConfig.onError);
+      } finally {
+        recordStopwatch.stop();
       }
-      recordStopwatch.stop();
     } finally {
       safeSetState(() {});
     }
@@ -1538,7 +1586,29 @@ class CameraPickerState extends State<CameraPicker>
     required CameraValue cameraValue,
     required BoxConstraints constraints,
   }) {
-    Widget preview = Listener(
+    Widget preview = const SizedBox.shrink();
+    if (innerController != null) {
+      preview = CameraPreview(controller);
+      preview = ValueListenableBuilder<CameraValue>(
+        valueListenable: controller,
+        builder: (_, CameraValue value, Widget? child) {
+          final lockedOrientation = value.lockedCaptureOrientation;
+          int? quarterTurns = lockedOrientation?.index;
+          if (quarterTurns == null) {
+            return child!;
+          }
+          if (value.deviceOrientation == DeviceOrientation.landscapeLeft) {
+            quarterTurns--;
+          } else if (value.deviceOrientation ==
+              DeviceOrientation.landscapeRight) {
+            quarterTurns++;
+          }
+          return RotatedBox(quarterTurns: quarterTurns, child: child);
+        },
+        child: preview,
+      );
+    }
+    preview = Listener(
       onPointerDown: (_) => pointers++,
       onPointerUp: (_) => pointers--,
       child: GestureDetector(
@@ -1547,9 +1617,7 @@ class CameraPickerState extends State<CameraPicker>
             pickerConfig.enablePinchToZoom ? handleScaleUpdate : null,
         // Enabled cameras switching by default if we have multiple cameras.
         onDoubleTap: cameras.length > 1 ? switchCameras : null,
-        child: innerController != null
-            ? CameraPreview(controller)
-            : const SizedBox.shrink(),
+        child: preview,
       ),
     );
 
@@ -1564,7 +1632,6 @@ class CameraPickerState extends State<CameraPicker>
       preview = Stack(
         children: <Widget>[
           preview,
-          // Image.asset('assets/1.jpg', fit: BoxFit.cover),
           Positioned.fill(
             child: ExcludeSemantics(
               child: RotatedBox(
