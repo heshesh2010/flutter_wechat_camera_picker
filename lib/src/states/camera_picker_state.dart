@@ -189,6 +189,12 @@ class CameraPickerState extends State<CameraPicker>
     return pickerConfig.minimumRecordingDuration;
   }
 
+  /// Whether the capture button is displaying.
+  bool get shouldCaptureButtonDisplay =>
+      isControllerBusy ||
+      (innerController?.value.isRecordingVideo ?? false) &&
+          isRecordingRestricted;
+
   /// Whether the camera preview should be rotated.
   bool get isCameraRotated => pickerConfig.cameraQuarterTurns % 4 != 0;
 
@@ -255,6 +261,7 @@ class CameraPickerState extends State<CameraPicker>
     } else if (state == AppLifecycleState.inactive) {
       c.dispose();
       innerController = null;
+      isControllerBusy = false;
     }
   }
 
@@ -262,8 +269,11 @@ class CameraPickerState extends State<CameraPicker>
   /// 根据 [constraints] 获取相机预览适用的缩放。
   double effectiveCameraScale(
     BoxConstraints constraints,
-    CameraController controller,
+    CameraController? controller,
   ) {
+    if (controller == null) {
+      return 1;
+    }
     final int turns = cameraQuarterTurns;
     final String orientation = controller.value.deviceOrientation.toString();
     // Fetch the biggest size from the constraints.
@@ -833,7 +843,10 @@ class CameraPickerState extends State<CameraPicker>
     if (isControllerBusy) {
       return;
     }
-    isControllerBusy = true;
+    setState(() {
+      isControllerBusy = true;
+      isShootingButtonAnimate = true;
+    });
     final ExposureMode previousExposureMode = controller.value.exposureMode;
     try {
       await Future.wait(<Future<void>>[
@@ -883,8 +896,10 @@ class CameraPickerState extends State<CameraPicker>
     } catch (e, s) {
       handleErrorWithHandler(e, s, pickerConfig.onError);
     } finally {
-      isControllerBusy = false;
-      safeSetState(() {});
+      safeSetState(() {
+        isControllerBusy = false;
+        isShootingButtonAnimate = false;
+      });
     }
   }
 
@@ -911,14 +926,8 @@ class CameraPickerState extends State<CameraPicker>
   /// 将被取消，并且状态会重置。
   void recordDetectionCancel(PointerUpEvent event) {
     recordDetectTimer?.cancel();
-    if (isShootingButtonAnimate) {
-      safeSetState(() {
-        isShootingButtonAnimate = false;
-      });
-    }
+
     if (innerController?.value.isRecordingVideo == true) {
-      lastShootingButtonPressedPosition = null;
-      safeSetState(() {});
       stopRecordingVideo();
     }
   }
@@ -929,7 +938,10 @@ class CameraPickerState extends State<CameraPicker>
     if (isControllerBusy) {
       return;
     }
-    isControllerBusy = true;
+    setState(() {
+      isControllerBusy = true;
+      isShootingButtonAnimate = true;
+    });
     try {
       await controller.startVideoRecording();
       if (isRecordingRestricted) {
@@ -942,7 +954,6 @@ class CameraPickerState extends State<CameraPicker>
         ..reset()
         ..start();
     } catch (e, s) {
-      isControllerBusy = false;
       if (!controller.value.isRecordingVideo) {
         handleErrorWithHandler(e, s, pickerConfig.onError);
         return;
@@ -957,26 +968,27 @@ class CameraPickerState extends State<CameraPicker>
         recordStopwatch.stop();
       }
     } finally {
-      safeSetState(() {});
+      safeSetState(() {
+        isControllerBusy = false;
+      });
     }
   }
 
   /// Stop the recording process.
   /// 停止录制视频
   Future<void> stopRecordingVideo() async {
-    void handleError() {
-      recordCountdownTimer?.cancel();
-      isShootingButtonAnimate = false;
-      safeSetState(() {});
+    if (isControllerBusy) {
+      return;
     }
 
     recordStopwatch.stop();
     if (!controller.value.isRecordingVideo) {
-      handleError();
+      recordCountdownTimer?.cancel();
       return;
     }
     safeSetState(() {
-      isShootingButtonAnimate = false;
+      isControllerBusy = true;
+      lastShootingButtonPressedPosition = null;
     });
     try {
       final XFile file = await controller.stopVideoRecording();
@@ -984,7 +996,7 @@ class CameraPickerState extends State<CameraPicker>
         pickerConfig.onMinimumRecordDurationNotMet?.call();
         return;
       }
-      await controller.pausePreview();
+      controller.pausePreview();
       final bool? isCapturedFileHandled = pickerConfig.onXFileCaptured?.call(
         file,
         CameraPickerViewType.video,
@@ -1003,11 +1015,13 @@ class CameraPickerState extends State<CameraPicker>
       }
     } catch (e, s) {
       handleErrorWithHandler(e, s, pickerConfig.onError);
-      handleError();
+      recordCountdownTimer?.cancel();
       initCameras();
     } finally {
-      isControllerBusy = false;
-      safeSetState(() {});
+      safeSetState(() {
+        isControllerBusy = false;
+        isShootingButtonAnimate = false;
+      });
     }
   }
 
@@ -1321,17 +1335,17 @@ class CameraPickerState extends State<CameraPicker>
                       ),
                     ),
                   ),
-                  if ((innerController?.value.isRecordingVideo ?? false) &&
-                      isRecordingRestricted)
+                  if (shouldCaptureButtonDisplay)
                     RotatedBox(
                       quarterTurns:
                           !enableScaledPreview ? cameraQuarterTurns : 0,
                       child: CameraProgressButton(
                         isAnimating: isShootingButtonAnimate,
+                        isBusy: isControllerBusy,
                         duration: pickerConfig.maximumRecordingDuration!,
-                        outerRadius: outerSize.width,
+                        size: outerSize,
                         ringsColor: theme.indicatorColor,
-                        ringsWidth: 2,
+                        ringsWidth: 3,
                       ),
                     ),
                 ],
@@ -1677,7 +1691,7 @@ class CameraPickerState extends State<CameraPicker>
     // Scale the preview if the config is enabled.
     if (enableScaledPreview) {
       preview = Transform.scale(
-        scale: effectiveCameraScale(constraints, controller),
+        scale: effectiveCameraScale(constraints, innerController),
         child: Center(child: transformedWidget ?? preview),
       );
       // Rotated the preview if the turns is valid.
